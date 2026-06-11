@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""TaxKittie — Russian 3-НДФЛ tax-return tool for an ИП on ОСНО.
+
+Compute the tax, print a bilingual RU/EN summary, and emit ФНС КНД 1151020 XML.
+Single-file Python 3 tool — stdlib only, Python >= 3.11.
+
+    ./taxkittie compute --year 2023 --income 1000000
+    ./taxkittie xml     --year 2024 --income 0 --out return-2024.xml
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+
+__version__ = "0.1.0"
+
+
+# ──────────────────────────────── rates ────────────────────────────────
+# Year-specific Russian tax parameters. Sources: НК РФ ч. 2 — гл. 23 (НДФЛ,
+# ст. 210, 221, 224), ст. 430 (взносы), ст. 75 (пени), ст. 119 / 122 (штрафы).
+
+# Fixed insurance contributions "за себя" (ОПС + ОМС, single combined sum), ₽.
+FIXED_CONTRIBUTIONS: dict[int, int] = {
+    2023: 45_842, 2024: 49_500, 2025: 53_658, 2026: 57_390,
+}
+CONTRIB_EXTRA_THRESHOLD = 300_000     # 1 % pension contribution above this
+CONTRIB_EXTRA_RATE = 0.01
+
+# Professional deduction for an ИП without documented expenses (ст. 221): 20 %.
+STANDARD_PROFESSIONAL_DEDUCTION_RATE = 0.20
+
+# Progressive НДФЛ scale per year: ordered (upper_bound, rate); last bound = +inf.
+NDFL_BRACKETS: dict[int, list[tuple[float, float]]] = {
+    2023: [(5_000_000, 0.13), (math.inf, 0.15)],
+    2024: [(5_000_000, 0.13), (math.inf, 0.15)],
+    2025: [(2_400_000, 0.13), (5_000_000, 0.15), (20_000_000, 0.18),
+           (50_000_000, 0.20), (math.inf, 0.22)],
+    2026: [(2_400_000, 0.13), (5_000_000, 0.15), (20_000_000, 0.18),
+           (50_000_000, 0.20), (math.inf, 0.22)],
+}
+
+FINE_119_RATE_PER_MONTH = 0.05        # ст. 119: 5 %/month, min 1000, cap 30 %
+FINE_119_MIN = 1_000
+FINE_119_CAP = 0.30
+FINE_122_RATE = 0.20                  # ст. 122: 20 % of unpaid tax
+PENI_FRACTION = 1 / 300               # ст. 75: 1/300 of the key rate per day
+
+# Bank of Russia key rate history (effective-from -> annual rate). Approximate.
+KEY_RATE_HISTORY: list[tuple[tuple[int, int, int], float]] = [
+    ((2023, 7, 24), 0.085), ((2023, 8, 15), 0.12), ((2023, 9, 18), 0.13),
+    ((2023, 10, 30), 0.15), ((2023, 12, 18), 0.16), ((2024, 7, 29), 0.18),
+    ((2024, 9, 16), 0.19), ((2024, 10, 28), 0.21), ((2025, 6, 9), 0.20),
+    ((2025, 7, 28), 0.18), ((2025, 9, 15), 0.17),
+]
+
+
+def _latest(table, year):
+    if year in table:
+        return table[year]
+    return table[max((y for y in table if y <= year), default=max(table))]
+
+
+def fixed_contributions(year: int) -> int:
+    """Fixed страховые взносы за себя for a full year (not pro-rated)."""
+    return _latest(FIXED_CONTRIBUTIONS, year)
+
+
+def ndfl_brackets(year: int) -> list[tuple[float, float]]:
+    return _latest(NDFL_BRACKETS, year)
+
+
+# ──────────────────────────────── model ────────────────────────────────
+@dataclass
+class Taxpayer:
+    """The individual entrepreneur filing the return."""
+
+    last_name: str
+    first_name: str
+    patronymic: str
+    inn: str
+    ogrnip: str = ""
+    phone: str = ""
+    tax_authority_code: str = ""      # код налогового органа (e.g. "7701")
+    oktmo: str = ""                   # ОКТМО (e.g. "45000000")
+    okved: str = "62.01"             # ОКВЭД основного вида деятельности
+
+    @property
+    def full_name(self) -> str:
+        return " ".join(p for p in (self.last_name, self.first_name, self.patronymic) if p)
+
+
+@dataclass
+class TaxReturn:
+    """A single tax-year 3-НДФЛ return for an ИП on the general regime (ОСНО).
+
+    Only entrepreneurial income (Приложение 3) is modelled.
+    """
+
+    year: int
+    taxpayer: Taxpayer
+    income: int = 0                          # доход от предпр. деятельности, ₽
+    documented_expenses: int | None = None   # None -> 20 % standard deduction
+    advance_payments: int = 0                # уплаченные авансы по НДФЛ, ₽
+    correction_number: int = 0               # номер корректировки (0 = первичная)
+
+    def is_nil(self) -> bool:
+        return self.income == 0
+
+
+# ──────────────────────────────── tax ────────────────────────────────
+@dataclass
+class TaxResult:
+    year: int
+    income: int
+    professional_deduction: int
+    tax_base: int
+    ndfl: int
+    tax_due: int
+    peni: int = 0
+    fine_119: int = 0
+    fine_122: int = 0
+
+    @property
+    def total_payable(self) -> int:
+        return self.tax_due + self.peni + self.fine_119 + self.fine_122
+
+
+def professional_deduction(tr: TaxReturn) -> int:
+    """20 % standard deduction, or documented expenses if larger (ст. 221)."""
+    standard = round(tr.income * STANDARD_PROFESSIONAL_DEDUCTION_RATE)
+    if tr.documented_expenses is None:
+        return standard
+    return max(standard, tr.documented_expenses)
+
+
+def ndfl_on_base(base: int, year: int) -> int:
+    """Progressive НДФЛ on a tax base for the given year."""
+    tax = 0.0
+    lower = 0.0
+    for upper, rate in ndfl_brackets(year):
+        if base <= lower:
+            break
+        tax += (min(base, upper) - lower) * rate
+        lower = upper
+    return round(tax)
+
+
+def filing_deadline(year: int) -> date:
+    """The 3-НДФЛ return is due by 30 April of the following year."""
+    return date(year + 1, 4, 30)
+
+
+def payment_deadline(year: int) -> date:
+    """НДФЛ for the year is due by 15 July of the following year."""
+    return date(year + 1, 7, 15)
+
+
+def _key_rate_on(day: date) -> float:
+    rate = KEY_RATE_HISTORY[0][1]
+    for (y, m, d), value in KEY_RATE_HISTORY:
+        if date(y, m, d) <= day:
+            rate = value
+        else:
+            break
+    return rate
+
+
+def peni(amount: int, due: date, paid: date) -> int:
+    """Пени for an individual/ИП (ст. 75): 1/300 of the CB key rate per day,
+    from the day after the deadline through the payment day."""
+    if amount <= 0 or paid <= due:
+        return 0
+    total = 0.0
+    day = due + timedelta(days=1)
+    while day <= paid:
+        total += amount * _key_rate_on(day) * PENI_FRACTION
+        day += timedelta(days=1)
+    return round(total)
+
+
+def _started_months(start: date, end: date) -> int:
+    if end <= start:
+        return 0
+    months = (end.year - start.year) * 12 + (end.month - start.month)
+    if end.day > start.day:
+        months += 1
+    return max(months, 1)
+
+
+def fine_119(unpaid_tax: int, deadline: date, filing_date: date) -> int:
+    """Late-filing fine (ст. 119): 5 %/started-month of unpaid tax, min 1000, cap 30 %."""
+    if filing_date <= deadline:
+        return 0
+    pct = min(_started_months(deadline, filing_date) * FINE_119_RATE_PER_MONTH, FINE_119_CAP)
+    return max(round(unpaid_tax * pct), FINE_119_MIN)
+
+
+def fine_122(unpaid_tax: int, paid_before_filing: bool) -> int:
+    """Non-payment fine (ст. 122): 20 % of the tax, avoided if it was paid
+    (with пени) before the late return is filed (ст. 81)."""
+    if paid_before_filing or unpaid_tax <= 0:
+        return 0
+    return round(unpaid_tax * FINE_122_RATE)
+
+
+def compute(
+    tr: TaxReturn,
+    *,
+    filing_date: date | None = None,
+    payment_date: date | None = None,
+    paid_before_filing: bool = False,
+) -> TaxResult:
+    """Compute the return's НДФЛ and, when dates are given, пени and fines."""
+    deduction = professional_deduction(tr)
+    base = max(tr.income - deduction, 0)
+    ndfl = ndfl_on_base(base, tr.year)
+    tax_due = max(ndfl - tr.advance_payments, 0)
+    result = TaxResult(tr.year, tr.income, deduction, base, ndfl, tax_due)
+    if payment_date is not None and tax_due > 0:
+        result.peni = peni(tax_due, payment_deadline(tr.year), payment_date)
+    if filing_date is not None:
+        result.fine_119 = fine_119(tax_due, filing_deadline(tr.year), filing_date)
+        result.fine_122 = fine_122(tax_due, paid_before_filing)
+    return result
+
+
+# ──────────────────────────────── render ────────────────────────────────
+def _rub(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ") + " ₽"
+
+
+def _rows(tr: TaxReturn, r: TaxResult) -> list[tuple[str, str, str]]:
+    rows = [
+        ("Налогоплательщик", "Taxpayer", tr.taxpayer.full_name),
+        ("ИНН", "INN (taxpayer ID)", tr.taxpayer.inn),
+        ("ОГРНИП", "OGRNIP", tr.taxpayer.ogrnip or "—"),
+        ("Налоговый период", "Tax year", str(tr.year)),
+        ("Код налогового органа", "Tax office code", tr.taxpayer.tax_authority_code or "—"),
+        ("Система налогообложения", "Tax regime", "ОСНО / OSNO (general)"),
+        ("Вид декларации", "Return type",
+         "первичная / primary" if tr.correction_number == 0
+         else f"корректировка №{tr.correction_number} / amended"),
+        ("Доход от предпринимательской деятельности", "Business income", _rub(tr.income)),
+        ("Профессиональный налоговый вычет", "Professional deduction", _rub(r.professional_deduction)),
+        ("Налоговая база", "Tax base", _rub(r.tax_base)),
+        ("НДФЛ исчисленный", "Personal income tax", _rub(r.ndfl)),
+        ("Сумма налога к уплате", "Tax payable", _rub(r.tax_due)),
+    ]
+    if r.peni or r.fine_119 or r.fine_122:
+        rows += [
+            ("Пени (ст. 75 НК)", "Late-payment interest", _rub(r.peni)),
+            ("Штраф за непредставление (ст. 119)", "Late-filing fine", _rub(r.fine_119)),
+            ("Штраф за неуплату (ст. 122)", "Non-payment fine", _rub(r.fine_122)),
+            ("ИТОГО к уплате", "TOTAL payable", _rub(r.total_payable)),
+        ]
+    return rows
+
+
+def render(tr: TaxReturn, result: TaxResult, lang: str = "both") -> str:
+    """Render the return as aligned text. lang: "ru", "en" or "both"."""
+    rows = _rows(tr, result)
+    if lang == "ru":
+        labels = [ru for ru, _, _ in rows]
+    elif lang == "en":
+        labels = [en for _, en, _ in rows]
+    else:
+        labels = [f"{ru} / {en}" for ru, en, _ in rows]
+    width = max(len(label) for label in labels)
+    body = "\n".join(f"{label:<{width}}  {val}" for label, (_, _, val) in zip(labels, rows))
+    title = f"3-НДФЛ · {tr.year} · {tr.taxpayer.full_name}"
+    return f"{title}\n{'─' * len(title)}\n{body}"
+
+
+# ──────────────────────────────── ФНС XML ────────────────────────────────
+# ⚠️  This builds the *documented* КНД 1151020 envelope. Element names, the
+# attribute set and the format version (ВерсФорм) differ per year and are fixed
+# by the ФНС приказ. VALIDATE against the official year XSD before submitting.
+FORMAT_VERSION = "5.10"               # placeholder — set to the official ВерсФорм
+PROGRAM_VERSION = f"TaxKittie {__version__}"
+KBK_NDFL_IP = "18210102020011000110"
+TAX_PERIOD_YEAR = "34"
+PLACE_IP_RESIDENCE = "320"
+
+
+def _money(amount: int) -> str:
+    return f"{amount}.00"
+
+
+def build_tree(tr: TaxReturn, result: TaxResult, *, doc_date: date) -> ET.Element:
+    tp = tr.taxpayer
+    file_id = f"NO_NDFL_{tp.tax_authority_code or '0000'}_{tp.inn}_{doc_date:%Y%m%d}"
+    root = ET.Element("Файл", {
+        "ИдФайл": file_id, "ВерсПрог": PROGRAM_VERSION, "ВерсФорм": FORMAT_VERSION,
+    })
+    doc = ET.SubElement(root, "Документ", {
+        "КНД": "1151020", "ДатаДок": f"{doc_date:%d.%m.%Y}", "Период": TAX_PERIOD_YEAR,
+        "ОтчетГод": str(tr.year), "КодНО": tp.tax_authority_code,
+        "НомКорр": str(tr.correction_number), "ПоМесту": PLACE_IP_RESIDENCE,
+    })
+    np = ET.SubElement(doc, "СвНП", {"ОКТМО": tp.oktmo})
+    ET.SubElement(np, "НПФЛ", {"ИННФЛ": tp.inn, "Тлф": tp.phone}).append(
+        ET.Element("ФИО", {"Фамилия": tp.last_name, "Имя": tp.first_name, "Отчество": tp.patronymic})
+    )
+    decl_el = ET.SubElement(doc, "Декларация")
+    ET.SubElement(decl_el, "Раздел1", {
+        "КБК": KBK_NDFL_IP, "ОКТМО": tp.oktmo, "НалПУ": _money(result.tax_due),
+    })
+    ET.SubElement(decl_el, "Раздел2", {
+        "Ставка": "13", "ОбщСумДох": _money(tr.income),
+        "СумProfВыч": _money(result.professional_deduction), "НалБаза": _money(result.tax_base),
+        "НалИсчисл": _money(result.ndfl), "АвансУпл": _money(tr.advance_payments),
+        "НалПУ": _money(result.tax_due),
+    })
+    ET.SubElement(decl_el, "Прил3", {
+        "ВидДеят": "01", "ОКВЭД": tp.okved, "СумДох": _money(tr.income),
+        "СумРасхВсего": _money(result.professional_deduction),
+    })
+    return root
+
+
+def to_bytes(tr: TaxReturn, result: TaxResult, *, doc_date: date) -> bytes:
+    """Return the 3-НДФЛ as windows-1251 XML bytes (ФНС standard encoding)."""
+    root = build_tree(tr, result, doc_date=doc_date)
+    ET.indent(root, space="  ")
+    body = ET.tostring(root, encoding="unicode")
+    return ('<?xml version="1.0" encoding="windows-1251"?>\n' + body).encode("windows-1251")
+
+
+# ──────────────────────────────── CLI ────────────────────────────────
+def _date(value: str | None) -> date | None:
+    return datetime.strptime(value, "%Y-%m-%d").date() if value else None
+
+
+def _taxpayer(args: argparse.Namespace) -> Taxpayer:
+    parts = (args.name or "").split()
+    last, first, patronymic = (parts + ["", "", ""])[:3]
+    return Taxpayer(last, first, patronymic, args.inn, ogrnip=args.ogrnip, phone=args.phone,
+                    tax_authority_code=args.code, oktmo=args.oktmo, okved=args.okved)
+
+
+def _tax_return(args: argparse.Namespace) -> TaxReturn:
+    return TaxReturn(args.year, _taxpayer(args), income=args.income,
+                     documented_expenses=args.expenses, advance_payments=args.advance,
+                     correction_number=args.correction)
+
+
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--year", type=int, required=True)
+    parser.add_argument("--income", type=int, default=0, help="business income, ₽")
+    parser.add_argument("--expenses", type=int, default=None,
+                        help="documented expenses, ₽ (omit → 20%% standard deduction)")
+    parser.add_argument("--advance", type=int, default=0, help="advance НДФЛ paid, ₽")
+    parser.add_argument("--correction", type=int, default=0, help="amended-return number")
+    parser.add_argument("--name", default="", help='"Фамилия Имя Отчество"')
+    parser.add_argument("--inn", default="")
+    parser.add_argument("--ogrnip", default="")
+    parser.add_argument("--phone", default="")
+    parser.add_argument("--code", default="", help="код налогового органа")
+    parser.add_argument("--oktmo", default="")
+    parser.add_argument("--okved", default="62.01")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="taxkittie",
+                                     description="3-НДФЛ tax returns for an ИП on ОСНО")
+    parser.add_argument("--version", action="version", version=f"TaxKittie {__version__}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("compute", help="compute the tax and print a bilingual summary")
+    _add_common(c)
+    c.add_argument("--filing-date", help="YYYY-MM-DD, for the late-filing fine")
+    c.add_argument("--payment-date", help="YYYY-MM-DD, for пени")
+    c.add_argument("--paid-before-filing", action="store_true",
+                   help="tax + пени settled before filing → no ст. 122 fine")
+    c.add_argument("--lang", choices=["ru", "en", "both"], default="both")
+
+    x = sub.add_parser("xml", help="emit ФНС КНД 1151020 XML")
+    _add_common(x)
+    x.add_argument("--out", required=True, help="output .xml path")
+    x.add_argument("--doc-date", help="YYYY-MM-DD (default: today)")
+
+    args = parser.parse_args(argv)
+    tr = _tax_return(args)
+
+    if args.cmd == "compute":
+        result = compute(tr, filing_date=_date(args.filing_date),
+                         payment_date=_date(args.payment_date),
+                         paid_before_filing=args.paid_before_filing)
+        print(render(tr, result, args.lang))
+    elif args.cmd == "xml":
+        result = compute(tr)
+        data = to_bytes(tr, result, doc_date=_date(args.doc_date) or date.today())
+        with open(args.out, "wb") as fh:
+            fh.write(data)
+        print(f"wrote {args.out} ({len(data)} bytes) — validate against the official XSD")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
