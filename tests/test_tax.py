@@ -253,6 +253,13 @@ def test_book_balanced_braces():
     assert tex.count(r"\begin{document}") == 1 and tex.count(r"\end{document}") == 1
 
 
+def test_book_has_paragraph_breaks():
+    # blocks must be separated by blank lines, else the heading/note run together
+    f = Filing(2026, IP, regime="psn", income=0)
+    tex = build_book_tex(f, [], doc_date=date(2026, 6, 12))
+    assert "\\end{tabular}\n\n" in tex
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

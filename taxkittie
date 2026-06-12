@@ -785,19 +785,27 @@ def build_book_tex(f: Filing, operations, *, doc_date: date) -> str:
                 + r" руб., налоговая база " + _tex_money(res.tax_base) + r" руб., НДФЛ "
                 + _tex_money(res.tax) + r" руб.")
 
+    # NB: blank-line entries ("") force LaTeX paragraph breaks between block
+    # elements — without them the tabular, heading and note run together.
     title2, title3 = BOOK_TITLE[f.regime]
-    p = [_TEX_PREAMBLE, r"\begin{center}", r"  {\Large\bfseries КНИГА}\\[4pt]",
+    p = [_TEX_PREAMBLE,
+         r"\begin{center}", r"  {\Large\bfseries КНИГА}\\[4pt]",
          r"  {\large " + title2 + r"}\\", r"  {\large " + title3 + r"}\\[10pt]",
-         r"  {\large\bfseries за " + str(f.year) + r" год}", r"\end{center}", r"\vspace{1.4em}",
+         r"  {\large\bfseries за " + str(f.year) + r" год}", r"\end{center}", "",
+         r"\vspace{1.4em}",
          r"\begin{tabular}{@{}>{\bfseries}p{6.5cm} p{16cm}@{}}",
          "  " + " \\\\\n  ".join(k + r": & " + v for k, v in ident) + r" \\",
-         r"\end{tabular}", r"\vspace{2.2em}",
-         r"{\large\bfseries Раздел I. Учёт доходов" + (r" и расходов" if has_exp else "") + r"}",
-         r"\vspace{8pt}", r"\begin{longtable}{" + cols + r"}",
+         r"\end{tabular}", "",
+         r"\vspace{2.2em}",
+         r"{\large\bfseries Раздел I. Учёт доходов" + (r" и расходов" if has_exp else "") + r"}", "",
+         r"\vspace{8pt}",
+         r"\begin{longtable}{" + cols + r"}",
          r"  \hline " + header, r"  \hline \endfirsthead",
          r"  \hline " + header, r"  \hline \endhead"]
     p += rows
-    p += [total, r"  \hline", r"\end{longtable}", r"\vspace{1.2em}", note, r"\vspace{3em}",
+    p += [total, r"  \hline", r"\end{longtable}", "",
+          r"\vspace{1.2em}", note, "",
+          r"\vspace{3em}",
           r"\begin{tabular}{@{}p{12cm}@{}}",
           r"  Подпись \hrulefill\ /" + _tex_escape(who[1]) + r"/ \\",
           r"\end{tabular}", r"\end{document}", ""]
