@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 # ════════════════════════════════ rates ════════════════════════════════
@@ -684,9 +684,137 @@ def to_bytes(f: Filing, r: TaxResult, *, doc_date: date) -> bytes:
     return ('<?xml version="1.0" encoding="windows-1251"?>\n' + body).encode("windows-1251")
 
 
+# ════════════════════════════════ КУДиР / books (LaTeX) ════════════════════════
+# Income/expense ledgers a taxpayer must keep, rendered as XeLaTeX for Windows:
+#   ПСН  → «Книга учёта доходов» (income only, ст. 346.53)
+#   УСН  → «КУДиР» (доходы и расходы)
+#   ОСНО → «Книга учёта доходов и расходов и хозяйственных операций» (Приказ 86н)
+# Compile with:  xelatex <file>.tex   (XeLaTeX, not pdfLaTeX — Cyrillic).
+BOOK_TITLE = {
+    "psn": ("учёта доходов индивидуального предпринимателя,",
+            "применяющего патентную систему налогообложения"),
+    "usn": ("учёта доходов и расходов индивидуальных предпринимателей и",
+            "организаций, применяющих упрощённую систему налогообложения"),
+    "osno": ("учёта доходов и расходов и хозяйственных операций",
+             "индивидуального предпринимателя"),
+}
+
+_TEX_PREAMBLE = r"""% Compile on Windows:  xelatex <thisfile>.tex
+% Requires XeLaTeX (Cyrillic) — pdfLaTeX will NOT work. Font: Times New Roman
+% (on every Windows); swap \setmainfont for "PT Serif"/"DejaVu Serif" if absent.
+\documentclass[11pt]{article}
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+\usepackage[russian]{babel}
+\usepackage[a4paper,landscape,margin=1.6cm]{geometry}
+\usepackage{longtable,array,makecell}
+\renewcommand{\arraystretch}{1.35}
+\setlength{\parindent}{0pt}
+\begin{document}
+"""
+
+
+def _tex_escape(s: str) -> str:
+    repl = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+            "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+            "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+    return "".join(repl.get(c, c) for c in s)
+
+
+def _tex_money(amount: int) -> str:
+    return f"{amount:,}".replace(",", "\\,") + ",00"
+
+
+def build_book_tex(f: Filing, operations, *, doc_date: date) -> str:
+    """Render the regime's statutory ledger as a XeLaTeX document (string)."""
+    if f.regime not in BOOK_TITLE:
+        raise ValueError(f"no statutory ledger for {f.regime.upper()} "
+                         "(АУСН/НПД keep none); books exist for ПСН, УСН, ОСНО")
+    tp = f.taxpayer
+    has_exp = f.regime in ("usn", "osno")
+    if not operations:
+        operations = [("(дата)", "(№ док.)",
+                       "Доход от предпринимательской деятельности", f.income, f.expenses or 0)]
+
+    who = (("Организация / ИП", _tex_escape(tp.name)) if tp.is_org
+           else ("Индивидуальный предприниматель", _tex_escape(tp.full_name)))
+    ident = [who, ("ИНН", _tex_escape(tp.inn) or "—")]
+    ident.append(("КПП", _tex_escape(tp.kpp) or "—") if tp.is_org
+                 else ("ОГРНИП", _tex_escape(tp.ogrnip) or "—"))
+    ident += [("Налоговый орган", _tex_escape(tp.tax_authority_code) or "—"),
+              ("ОКВЭД", _tex_escape(tp.okved)), ("Единица измерения", "рубль")]
+
+    if has_exp:
+        cols = r"|c|p{3.4cm}|p{8cm}|r|r|"
+        header = (r"\bfseries № & \makecell{\bfseries Дата и №\\ \bfseries документа} & "
+                  r"\bfseries Содержание операции & \makecell{\bfseries Доходы,\\ \bfseries руб.}"
+                  r" & \makecell{\bfseries Расходы,\\ \bfseries руб.} \\")
+    else:
+        cols = r"|c|p{3.6cm}|p{10cm}|r|"
+        header = (r"\bfseries № & \makecell{\bfseries Дата и №\\ \bfseries документа} & "
+                  r"\bfseries Содержание операции & \makecell{\bfseries Сумма\\ \bfseries дохода, руб.} \\")
+
+    rows, inc_total, exp_total = [], 0, 0
+    for i, (d, doc, desc, inc, exp) in enumerate(operations, 1):
+        inc_total += inc
+        exp_total += exp
+        cell = r"\makecell[l]{" + _tex_escape(str(d)) + r"\\ " + _tex_escape(str(doc)) + r"}"
+        line = str(i) + r" & " + cell + r" & " + _tex_escape(str(desc)) + r" & " + _tex_money(inc)
+        line += (r" & " + (_tex_money(exp) if exp else "---")) if has_exp else ""
+        rows.append("  " + line + r" \\" + "\n  \\hline")
+    if has_exp:
+        total = (r"  \multicolumn{3}{|r|}{\bfseries Итого за год:} & \bfseries "
+                 + _tex_money(inc_total) + r" & \bfseries " + _tex_money(exp_total) + r" \\")
+    else:
+        total = (r"  \multicolumn{3}{|r|}{\bfseries Итого за год:} & \bfseries "
+                 + _tex_money(inc_total) + r" \\")
+
+    if f.regime == "psn":
+        note = (r"\textbf{Патентная система (ст.~346.53 НК).} Книга учёта доходов ведётся "
+                r"для контроля лимита дохода 60\,млн руб./год. Доход за год: "
+                + _tex_money(inc_total) + r" руб.")
+    elif f.regime == "usn":
+        res = compute(f)
+        obj = "доходы" if f.usn_object == "dohody" else "доходы минус расходы"
+        note = (r"\textbf{УСН («" + obj + r"»).} Налог к уплате по итогам года: "
+                + _tex_money(res.tax_due) + r" руб.")
+    else:
+        res = compute(f)
+        note = (r"\textbf{ОСНО.} Профессиональный вычет (ст.~221 НК): доход "
+                + _tex_money(f.income) + r" руб., вычет " + _tex_money(f.income - res.tax_base)
+                + r" руб., налоговая база " + _tex_money(res.tax_base) + r" руб., НДФЛ "
+                + _tex_money(res.tax) + r" руб.")
+
+    title2, title3 = BOOK_TITLE[f.regime]
+    p = [_TEX_PREAMBLE, r"\begin{center}", r"  {\Large\bfseries КНИГА}\\[4pt]",
+         r"  {\large " + title2 + r"}\\", r"  {\large " + title3 + r"}\\[10pt]",
+         r"  {\large\bfseries за " + str(f.year) + r" год}", r"\end{center}", r"\vspace{1.4em}",
+         r"\begin{tabular}{@{}>{\bfseries}p{6.5cm} p{16cm}@{}}",
+         "  " + " \\\\\n  ".join(k + r": & " + v for k, v in ident) + r" \\",
+         r"\end{tabular}", r"\vspace{2.2em}",
+         r"{\large\bfseries Раздел I. Учёт доходов" + (r" и расходов" if has_exp else "") + r"}",
+         r"\vspace{8pt}", r"\begin{longtable}{" + cols + r"}",
+         r"  \hline " + header, r"  \hline \endfirsthead",
+         r"  \hline " + header, r"  \hline \endhead"]
+    p += rows
+    p += [total, r"  \hline", r"\end{longtable}", r"\vspace{1.2em}", note, r"\vspace{3em}",
+          r"\begin{tabular}{@{}p{12cm}@{}}",
+          r"  Подпись \hrulefill\ /" + _tex_escape(who[1]) + r"/ \\",
+          r"\end{tabular}", r"\end{document}", ""]
+    return "\n".join(p)
+
+
 # ════════════════════════════════ CLI ════════════════════════════════
 def _date(value: str | None) -> date | None:
     return datetime.strptime(value, "%Y-%m-%d").date() if value else None
+
+
+def _operation(s: str) -> tuple:
+    """Parse a 'date;document;description;income;expense' ledger row."""
+    parts = (s.split(";") + ["", "", "", "", ""])[:5]
+    inc = int(parts[3]) if parts[3].strip() else 0
+    exp = int(parts[4]) if parts[4].strip() else 0
+    return (parts[0] or "(дата)", parts[1] or "(№ док.)", parts[2], inc, exp)
 
 
 def _taxpayer(a: argparse.Namespace) -> Taxpayer:
@@ -754,6 +882,13 @@ def main(argv: list[str] | None = None) -> int:
     x.add_argument("--out", required=True, help="output .xml path")
     x.add_argument("--doc-date", help="YYYY-MM-DD (default: today)")
 
+    b = sub.add_parser("book", help="emit the regime's ledger (КУД/КУДиР/86н) as XeLaTeX")
+    _add_common(b)
+    b.add_argument("--operation", action="append", metavar="D;DOC;DESC;INC;EXP",
+                   help="ledger row 'date;document;description;income;expense' (repeatable)")
+    b.add_argument("--out", required=True, help="output .tex path")
+    b.add_argument("--doc-date", help="YYYY-MM-DD (default: today)")
+
     a = parser.parse_args(argv)
     f = _filing(a)
 
@@ -767,6 +902,12 @@ def main(argv: list[str] | None = None) -> int:
         with open(a.out, "wb") as fh:
             fh.write(data)
         print(f"wrote {a.out} ({len(data)} bytes) — validate against the official XSD")
+    elif a.cmd == "book":
+        ops = [_operation(s) for s in (a.operation or [])]
+        tex = build_book_tex(f, ops, doc_date=_date(a.doc_date) or date.today())
+        with open(a.out, "w", encoding="utf-8") as fh:
+            fh.write(tex)
+        print(f"wrote {a.out} — compile on Windows with:  xelatex {a.out}")
     return 0
 
 

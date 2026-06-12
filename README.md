@@ -22,6 +22,9 @@ Companion to **CryptoKiddie** (which signs); TaxKittie *builds* the return.
   tariff) and 6-НДФЛ agent withholding on salaries.
 - **Penalties** — пени (ст. 75) and the late-filing / non-payment fines (ст. 119 / 122).
 - **ФНС XML** — КНД 1151020 (3-НДФЛ) and КНД 1152017 (УСН), windows-1251 encoded.
+- **Ledgers (КУДиР)** — the regime's statutory book as **XeLaTeX → PDF**: ПСН «Книга
+  учёта доходов» (income-only), УСН «КУДиР», ОСНО «…доходов и расходов и
+  хозяйственных операций» (86н). Compile on Windows with `xelatex`.
 
 ## Usage
 
@@ -41,6 +44,10 @@ Companion to **CryptoKiddie** (which signs); TaxKittie *builds* the return.
 
 # emit ФНС XML (3-НДФЛ or УСН)
 ./taxkittie xml --regime usn --entity org --year 2025 --income 3000000 --out usn.xml
+
+# the regime's ledger as XeLaTeX (compile on Windows: xelatex book.tex)
+./taxkittie book --regime osno --entity ip --year 2023 --income 1000000 \
+    --operation '2023-10-01;№5;Оплата услуг;1000000;0' --out book-2023.tex
 ```
 
 `--lang ru|en|both`, `--filing-date` / `--payment-date` (for penalties),

@@ -16,6 +16,7 @@ Filing, Taxpayer, compute = tk.Filing, tk.Taxpayer, tk.compute
 ndfl_on_base, professional_deduction = tk.ndfl_on_base, tk.professional_deduction
 ip_contributions, payroll_contributions = tk.ip_contributions, tk.payroll_contributions
 payroll_ndfl, build_tree = tk.payroll_ndfl, tk.build_tree
+build_book_tex = tk.build_book_tex
 
 # Fictional taxpayers — no real personal data.
 IP = Taxpayer("Петров", "Пётр", "Петрович", inn="770000000000",
@@ -197,6 +198,59 @@ def test_no_xml_for_psn():
     except ValueError:
         return
     raise AssertionError("expected no XML builder for ПСН")
+
+
+# ── КУДиР / books (LaTeX) ──────────────────────────────────────────────────
+def test_book_psn_is_income_only():
+    f = Filing(2026, IP, regime="psn", income=500_000, potential_income=1_000_000)
+    tex = build_book_tex(f, [], doc_date=date(2026, 6, 12))
+    assert "патентную систему" in tex
+    assert "Расходы" not in tex                       # ПСН book has no expense column
+    assert "500\\,000,00" in tex
+
+
+def test_book_usn_has_expense_column():
+    f = Filing(2026, IP, regime="usn", usn_object="dohody-rashody",
+               income=1_000_000, expenses=400_000)
+    tex = build_book_tex(f, [], doc_date=date(2026, 6, 12))
+    assert "упрощённую систему" in tex
+    assert "Расходы" in tex
+
+
+def test_book_osno_is_86n_with_ndfl_note():
+    f = Filing(2023, IP, regime="osno", income=252_700)
+    tex = build_book_tex(f, [], doc_date=date(2023, 1, 1))
+    assert "хозяйственных операций" in tex
+    assert "НДФЛ" in tex and "252\\,700,00" in tex
+
+
+def test_book_operations_render_and_total():
+    f = Filing(2023, IP, regime="osno", income=300_000)
+    ops = [tk._operation("2023-10-01;№5;Оплата услуг;200000;0"),
+           tk._operation("2023-11-01;№6;Оплата услуг;100000;0")]
+    tex = build_book_tex(f, ops, doc_date=date(2023, 1, 1))
+    assert "Оплата услуг" in tex
+    assert "300\\,000,00" in tex                       # 200000 + 100000 total
+
+
+def test_book_rejected_for_npd():
+    f = Filing(2026, IP, regime="npd", income=100_000)
+    try:
+        build_book_tex(f, [], doc_date=date(2026, 6, 12))
+    except ValueError:
+        return
+    raise AssertionError("expected no statutory book for НПД")
+
+
+def test_tex_escape_specials():
+    assert tk._tex_escape("A & B 50%") == r"A \& B 50\%"
+
+
+def test_book_balanced_braces():
+    f = Filing(2025, ORG, regime="usn", usn_object="dohody", income=3_000_000)
+    tex = build_book_tex(f, [], doc_date=date(2025, 6, 12))
+    assert tex.count("{") == tex.count("}")
+    assert tex.count(r"\begin{document}") == 1 and tex.count(r"\end{document}") == 1
 
 
 if __name__ == "__main__":
