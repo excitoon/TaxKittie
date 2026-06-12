@@ -689,7 +689,7 @@ def to_bytes(f: Filing, r: TaxResult, *, doc_date: date) -> bytes:
 #   ПСН  → «Книга учёта доходов» (income only, ст. 346.53)
 #   УСН  → «КУДиР» (доходы и расходы)
 #   ОСНО → «Книга учёта доходов и расходов и хозяйственных операций» (Приказ 86н)
-# Compile with:  xelatex <file>.tex   (XeLaTeX, not pdfLaTeX — Cyrillic).
+# Compile with:  pdflatex <file>.tex  (Cyrillic via T2A; stock pdfLaTeX, no fonts).
 BOOK_TITLE = {
     "psn": ("учёта доходов индивидуального предпринимателя,",
             "применяющего патентную систему налогообложения"),
@@ -699,12 +699,12 @@ BOOK_TITLE = {
              "индивидуального предпринимателя"),
 }
 
-_TEX_PREAMBLE = r"""% Compile on Windows:  xelatex <thisfile>.tex
-% Requires XeLaTeX (Cyrillic) — pdfLaTeX will NOT work. Font: Times New Roman
-% (on every Windows); swap \setmainfont for "PT Serif"/"DejaVu Serif" if absent.
+_TEX_PREAMBLE = r"""% Compile on Windows:  pdflatex <thisfile>.tex   (run twice if longtable asks)
+% Cyrillic via T2A encoding — works with stock pdfLaTeX (MiKTeX / TeX Live),
+% no XeLaTeX and no font install needed. Keep the source file UTF-8.
 \documentclass[11pt]{article}
-\usepackage{fontspec}
-\setmainfont{Times New Roman}
+\usepackage[T2A]{fontenc}
+\usepackage[utf8]{inputenc}
 \usepackage[russian]{babel}
 \usepackage[a4paper,landscape,margin=1.6cm]{geometry}
 \usepackage{longtable,array,makecell}
@@ -907,7 +907,7 @@ def main(argv: list[str] | None = None) -> int:
         tex = build_book_tex(f, ops, doc_date=_date(a.doc_date) or date.today())
         with open(a.out, "w", encoding="utf-8") as fh:
             fh.write(tex)
-        print(f"wrote {a.out} — compile on Windows with:  xelatex {a.out}")
+        print(f"wrote {a.out} — compile on Windows with:  pdflatex {a.out}")
     return 0
 
 
